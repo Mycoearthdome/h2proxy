@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# sudo apt install python3-systemd
+
 """
 Twisted HTTP/2 -> HTTP/1.1 streaming proxy with ipset-based Cloudflare whitelist.
 
@@ -10,8 +12,7 @@ Features:
 - Injects security headers and Cache-Control: public, max-age=31536000
 - Systemd-friendly (no internal daemonize)
 """
-
-import ssl
+import sys
 import urllib.request
 from ipaddress import ip_network, ip_address
 from twisted.internet import reactor, task
@@ -22,7 +23,6 @@ import h2.connection
 import h2.events
 import h2.config
 import re
-import os
 import signal
 import logging
 import subprocess
