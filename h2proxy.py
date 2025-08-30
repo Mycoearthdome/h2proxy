@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-# Hardened HTTP/2 -> HTTP/1.1 streaming proxy (modified: clamped metrics + event-driven send loop)
+# Hardened HTTP/2 -> HTTP/1.1 streaming proxy
+# RFC 7540 compliant with Cloudflare IP whitelisting, metrics, and diagnostics
 
 from __future__ import annotations
 import sys, time, logging, signal, ipaddress, subprocess, urllib.parse
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
-from twisted.internet import reactor, task, defer
+from twisted.internet import reactor, task
 from twisted.internet.threads import deferToThread
 from twisted.internet.protocol import Protocol, Factory
 from twisted.web.client import Agent, BrowserLikePolicyForHTTPS
-from twisted.web.resource import Resource
-from twisted.web.server import Site
 from twisted.web.http_headers import Headers
 from twisted.internet.defer import Deferred
 from twisted.protocols.policies import TimeoutMixin
+from twisted.web.server import Site
+from twisted.web.wsgi import WSGIResource
 
-import h2.connection, h2.events, h2.config, h2.settings
+import h2.connection
+import h2.events
+import h2.config
+import h2.settings
+import h2.errors
+
 import ssl as pyssl
-
-import os
 import urllib.request
+from collections import deque
 
 # ---------- Configuration ----------
-CLOUDFLARE_IPS_URL = "https://www.cloudflare.com/ips-v4"
-# ---------- IPSet helpers (dual-stack, kernel-backed, threaded fetch) ----------
-# single canonical ipset name used by OS-level firewall
 IPSET_NAME = "cloudflare_whitelist"
 LISTEN_PORT = 443
 UPSTREAM_HOST = "127.0.0.1"
@@ -36,7 +38,7 @@ KEY_FILE = "key.pem"
 
 MAX_CONCURRENT_STREAMS_DEFAULT = 200
 INITIAL_WINDOW_SIZE_DEFAULT = 256 * 1024
-MAX_FRAME_SIZE = 65536
+MAX_FRAME_SIZE_DEFAULT = 65536
 MAX_BUFFER_PER_STREAM = 4 * 1024 * 1024
 CONNECTION_IDLE_TIMEOUT = 300
 STREAM_INACTIVITY_TIMEOUT = 120
@@ -54,38 +56,31 @@ logger.addHandler(sh)
 # ---------- Metrics ----------
 USE_PROMETHEUS_CLIENT = False
 metrics = {
-    "requests_total":0,
-    "active_streams":0,
-    "bytes_in_total":0,
-    "bytes_out_total":0,
-    "streams_reset_total":0,
-    "ipset_refresh_count":0
+    "requests_total": 0,
+    "active_streams": 0,
+    "bytes_in_total": 0,
+    "bytes_out_total": 0,
+    "streams_reset_total": 0,
+    "ipset_refresh_count": 0
 }
 try:
-    from prometheus_client import Counter, Gauge, start_http_server, Histogram, make_wsgi_app
-    from twisted.web.wsgi import WSGIResource
+    from prometheus_client import Counter, Gauge, Histogram, make_wsgi_app
     USE_PROMETHEUS_CLIENT = True
-    PROM_REQUESTS = Counter("h2proxy_requests_total","Total requests proxied")
-    PROM_ACTIVE = Gauge("h2proxy_active_streams","Active streams")
-    PROM_BYTES_IN = Counter("h2proxy_bytes_in_total","Bytes received")
-    PROM_BYTES_OUT = Counter("h2proxy_bytes_out_total","Bytes sent")
-    PROM_RST = Counter("h2proxy_streams_reset","Streams reset")
-    PROM_STREAM_LATENCY = Histogram("h2proxy_stream_latency_seconds","Stream duration")
+    PROM_REQUESTS = Counter("h2proxy_requests_total", "Total requests proxied")
+    PROM_ACTIVE = Gauge("h2proxy_active_streams", "Active streams")
+    PROM_BYTES_IN = Counter("h2proxy_bytes_in_total", "Bytes received")
+    PROM_BYTES_OUT = Counter("h2proxy_bytes_out_total", "Bytes sent")
+    PROM_RST = Counter("h2proxy_streams_reset", "Streams reset")
+    PROM_STREAM_LATENCY = Histogram("h2proxy_stream_latency_seconds", "Stream duration")
 except Exception:
     USE_PROMETHEUS_CLIENT = False
 
 def safe_increment(metric_name, n=1):
-    """
-    Thread-safe metric update executed on the reactor thread.
-    - active_streams is clamped to >= 0 and sets the Prometheus gauge to the exact value.
-    - Counters are only incremented (ignore negative attempts).
-    """
     def _inc():
         old = metrics.get(metric_name, 0)
         new = old + n
 
         if metric_name == "active_streams":
-            # clamp
             if new < 0:
                 new = 0
             metrics[metric_name] = new
@@ -96,8 +91,7 @@ def safe_increment(metric_name, n=1):
                     pass
             return
 
-        # for counters, avoid decrementing them via this function (only support positive increments)
-        if metric_name in ("requests_total","bytes_in_total","bytes_out_total","streams_reset_total","ipset_refresh_count"):
+        if metric_name in ("requests_total", "bytes_in_total", "bytes_out_total", "streams_reset_total", "ipset_refresh_count"):
             if n > 0:
                 metrics[metric_name] = new
                 if USE_PROMETHEUS_CLIENT:
@@ -106,26 +100,23 @@ def safe_increment(metric_name, n=1):
                         elif metric_name == "bytes_in_total": PROM_BYTES_IN.inc(n)
                         elif metric_name == "bytes_out_total": PROM_BYTES_OUT.inc(n)
                         elif metric_name == "streams_reset_total": PROM_RST.inc(n)
-                        # ipset_refresh_count is an internal counter; we don't map it to a Prom client metric here
                     except Exception:
                         pass
             else:
-                # ignore negative adjustments to counters to prevent inconsistencies
                 metrics[metric_name] = max(0, old + n)
         else:
-            # generic fallback
             metrics[metric_name] = max(0, new)
 
     try:
         reactor.callFromThread(_inc)
     except Exception:
-        # If reactor not running (unit tests/etc), run inline
         _inc()
 
-def incr_bytes_out(n:int): safe_increment("bytes_out_total", n)
-def incr_bytes_in(n:int): safe_increment("bytes_in_total", n)
+def incr_bytes_out(n: int): safe_increment("bytes_out_total", n)
+def incr_bytes_in(n: int): safe_increment("bytes_in_total", n)
 def incr_streams_reset(): safe_increment("streams_reset_total", 1)
 
+# ---------- OS cmd helper ----------
 def run_cmd_blocking(cmd: List[str]) -> bool:
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -133,16 +124,15 @@ def run_cmd_blocking(cmd: List[str]) -> bool:
     except subprocess.CalledProcessError:
         return False
 
+# ---------- IPCollector ----------
 class IPCollector:
     CF_IPS_V4 = "https://www.cloudflare.com/ips-v4"
     CF_IPS_V6 = "https://www.cloudflare.com/ips-v6"
 
     def __init__(self):
-        # cached set of CIDR strings
-        self.valid_ips = set()
+        self.valid_ips: Set[str] = set()
 
     def _fetch_ips_blocking(self) -> List[str]:
-        """Blocking fetch of both IPv4 and IPv6 Cloudflare lists."""
         urls = [self.CF_IPS_V4, self.CF_IPS_V6]
         all_ips: List[str] = []
         for url in urls:
@@ -156,72 +146,49 @@ class IPCollector:
         return all_ips
 
     def refresh_ipset_blocking(self) -> bool:
-        """
-        Blocking: fetch Cloudflare ranges and atomically update the kernel ipset.
-        Returns True on success.
-        """
         ips = self._fetch_ips_blocking()
         if not ips:
             logger.warning("No Cloudflare IP ranges fetched; skipping ipset update")
             return False
 
-        # Build a temporary set, add members, then swap
         tmp_set = IPSET_NAME + "_tmp"
         try:
-            subprocess.run(["ipset","create",tmp_set,"hash:net"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["ipset", "create", tmp_set, "hash:net"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
         for cidr in ips:
             try:
-                subprocess.run(["ipset","add",tmp_set,cidr,"-exist"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["ipset", "add", tmp_set, cidr, "-exist"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
-        # swap into place
         try:
-            subprocess.run(["ipset","swap",tmp_set,IPSET_NAME], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["ipset","destroy",tmp_set], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["ipset", "swap", tmp_set, IPSET_NAME], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["ipset", "destroy", tmp_set], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             logger.warning("ipset swap/destroy failed: %s", e)
             return False
 
-        # update memory cache of ip networks for fallback checks
-        try:
-            self.valid_ips = set(ips)
-        except Exception:
-            self.valid_ips = set(ips)
-
+        self.valid_ips = set(ips)
         safe_increment("ipset_refresh_count", 1)
         logger.info("Refreshed ipset %s with %d entries", IPSET_NAME, len(self.valid_ips))
         return True
 
     def refresh_ipset(self):
-        """Schedule the blocking refresh on reactor threadpool."""
         return deferToThread(self.refresh_ipset_blocking)
 
     def is_valid_ip(self, ip: str) -> bool:
-        """
-        Prefer kernel ipset test (fast). If ipset isn't available or test fails, fall back
-        to in-memory CIDR matching.
-        """
-        # Try kernel-level ipset test first
         try:
-            res = subprocess.run(["ipset","test",IPSET_NAME,ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            res = subprocess.run(["ipset", "test", IPSET_NAME, ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             if res.returncode == 0:
                 return True
         except Exception:
-            # ipset not available/permission denied -> fall back
             pass
-
-        # Fallback: check against cached CIDRs
         try:
             ipaddr = ipaddress.ip_address(ip)
             for net in self.valid_ips:
-                try:
-                    if ipaddr in ipaddress.ip_network(net):
-                        return True
-                except Exception:
-                    continue
+                if ipaddr in ipaddress.ip_network(net):
+                    return True
         except Exception:
             pass
         return False
@@ -229,31 +196,6 @@ class IPCollector:
 # ---------- IPSet helpers ----------
 # instantiate a collector for the program to share
 ip_collector = IPCollector()
-
-
-class IPWhitelistProxy(Protocol):
-    def __init__(self, factory):
-        self.factory = factory
-        self.transport = None
-        self.client_ip = None
-
-    def connectionMade(self):
-        peer = self.transport.getPeer()
-        self.client_ip = peer.host
-        if not ip_collector.is_valid_ip(self.client_ip):
-            logger.warning(f"Connection rejected: {self.client_ip} not in Cloudflare ranges")
-            self.transport.loseConnection()
-            return
-        logger.info(f"Accepted proxied client from {self.client_ip}")
-        # Continue with normal H2 setup
-        self.factory.active_connections.add(self)
-        self.factory.protocol_instance = self
-        self.factory.h2_conn.initiate_connection()
-        self.factory._send_data()
-
-    def connectionLost(self, reason):
-        if self in self.factory.active_connections:
-            self.factory.active_connections.remove(self)
 
 
 def refresh_ipset_async(retries=3, delay=2):
@@ -300,38 +242,24 @@ def cleanup_ipset_and_rule():
         except Exception: pass
     deferToThread(_cleanup)
 
-def ipset_contains_peer(ip: str) -> bool:
-    try:
-        ipaddr = ipaddress.ip_address(ip)
-        # Use the cached Cloudflare networks from the collector
-        return any(ipaddr in ipaddress.ip_network(net) for net in ip_collector.valid_ips)
-    except Exception:
-        pass
+# ---------- Active H2 protocols ----------
+_active_h2_protocols: Set["H2ProxyProtocol"] = set()
 
-    # Fallback: kernel ipset check
-    try:
-        res = subprocess.run(
-            ["ipset", "test", IPSET_NAME, ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False
-        )
-        return res.returncode == 0
-    except Exception:
-        return False
-
-# ---------- Stream Metadata ----------
+# ---------- Stream metadata ----------
 class StreamMeta:
-    __slots__ = ('stream_id','protocol_ref','buffer','start','end','last_activity',
-                 'closed','inactivity_call','body_timeout_call','start_time','weight',
-                 'depends_on','exclusive')
+    __slots__ = (
+        'stream_id', 'protocol_ref', 'chunks', 'buffered_bytes',
+        'last_activity', 'closed', 'inactivity_call', 'body_timeout_call',
+        'start_time', 'weight', 'depends_on', 'exclusive', 'method'
+    )
 
-    def __init__(self, stream_id:int, proto):
+    CHUNK_SIZE = 16 * 1024  # 16 KB per chunk
+
+    def __init__(self, stream_id: int, proto, method: Optional[str] = None):
         self.stream_id = stream_id
         self.protocol_ref = proto
-        self.buffer = bytearray()
-        self.start = 0
-        self.end = 0
+        self.chunks = deque()
+        self.buffered_bytes = 0
         self.last_activity = time.time()
         self.closed = False
         self.inactivity_call = None
@@ -340,35 +268,36 @@ class StreamMeta:
         self.weight = None
         self.depends_on = None
         self.exclusive = None
-
-    @property
-    def buffered_bytes(self):
-        return self.end - self.start
+        self.method = method
 
     def enqueue(self, data: bytes):
-        if not data: return
-        self.buffer += data
-        self.end += len(data)
-        self.last_activity = time.time()
-        if self.buffered_bytes > MAX_BUFFER_PER_STREAM:
-            # reset with ENHANCE_YOUR_CALM when buffer grows too large
+        if not data:
+            return
+        if self.buffered_bytes + len(data) > MAX_BUFFER_PER_STREAM:
+            logger.warning("Stream %d buffer exceeded %d bytes, resetting",
+                           self.stream_id, MAX_BUFFER_PER_STREAM)
             self.reset_stream(h2.errors.ErrorCodes.ENHANCE_YOUR_CALM)
             return
-        if len(data) > 1024: self.reset_inactivity_timer()
-
-    def pop_chunk(self, size:int) -> Optional[bytes]:
-        if self.buffered_bytes==0: return None
-        n = min(size,self.buffered_bytes)
-        chunk = memoryview(self.buffer)[self.start:self.start+n].tobytes()
-        self.start += n
-        # Compact buffer if needed
-        if self.start>=1024*1024 or self.start==self.end:
-            self.buffer = self.buffer[self.start:]
-            self.end -= self.start
-            self.start = 0
+        # Break into fixed-size chunks
+        for i in range(0, len(data), self.CHUNK_SIZE):
+            chunk = memoryview(data[i:i+self.CHUNK_SIZE])
+            self.chunks.append(chunk)
+            self.buffered_bytes += len(chunk)
         self.last_activity = time.time()
         self.reset_inactivity_timer()
-        return chunk
+
+    def pop_chunk(self, max_size: int) -> Optional[bytes]:
+        if not self.chunks:
+            return None
+        chunk = self.chunks.popleft()
+        if len(chunk) > max_size:
+            # split chunk
+            self.chunks.appendleft(chunk[max_size:])
+            chunk = chunk[:max_size]
+        self.buffered_bytes -= len(chunk)
+        self.last_activity = time.time()
+        self.reset_inactivity_timer()
+        return chunk.tobytes()
 
     def reset_inactivity_timer(self):
         if self.inactivity_call:
@@ -390,36 +319,40 @@ class StreamMeta:
             try: self.body_timeout_call.cancel()
             except Exception: pass
 
-    def on_inactive(self): self.reset_stream(h2.errors.ErrorCodes.CANCEL, STREAM_INACTIVITY_TIMEOUT)
-    def on_body_timeout(self): self.reset_stream(h2.errors.ErrorCodes.CANCEL, STREAM_BODY_TIMEOUT)
+    def on_inactive(self):
+        self.reset_stream(h2.errors.ErrorCodes.CANCEL, STREAM_INACTIVITY_TIMEOUT)
+
+    def on_body_timeout(self):
+        self.reset_stream(h2.errors.ErrorCodes.CANCEL, STREAM_BODY_TIMEOUT)
 
     def reset_stream(self, code, duration=None):
-        code_int = int(code) if isinstance(code,int) else code
-        reason = getattr(h2.errors.ErrorCodes(code_int),"name",str(code_int))
-        logger.warning("Stream %d reset: %s after %s seconds", self.stream_id, reason, duration)
+        try:
+            code_int = int(code)
+        except Exception:
+            code_int = int(h2.errors.ErrorCodes.INTERNAL_ERROR)
+        logger.warning("Stream %d reset: %s after %s sec; buffered_bytes=%d",
+                       self.stream_id, code_int, duration, self.buffered_bytes)
         incr_streams_reset()
         try:
-            self.protocol_ref.h2_conn.reset_stream(self.stream_id,error_code=code_int)
+            self.protocol_ref.h2_conn.reset_stream(self.stream_id, error_code=code_int)
             self.protocol_ref.transport.write(self.protocol_ref.h2_conn.data_to_send())
-        except Exception: pass
+        except Exception:
+            pass
         self.clear()
 
     def clear(self):
-        # decrement active_streams (clamped in safe_increment)
-        safe_increment("active_streams",-1)
-        self.buffer = bytearray()
-        self.start = 0
-        self.end = 0
+        safe_increment("active_streams", -1)
         self.cancel_timers()
         try: del self.protocol_ref.stream_meta[self.stream_id]
         except KeyError: pass
-        # Observe duration if Prometheus enabled
         if USE_PROMETHEUS_CLIENT:
             duration = time.time() - self.start_time
             try: PROM_STREAM_LATENCY.observe(duration)
             except Exception: pass
 
-# ---------- Upstream via Twisted Agent ----------
+# ---------------------------------------------------------------------
+# Upstream receiver and request
+# ---------------------------------------------------------------------
 class UpstreamStreamReceiver(Protocol, TimeoutMixin):
     def __init__(self, h2_protocol: "H2ProxyProtocol", stream_meta: StreamMeta):
         self.h2_protocol = h2_protocol
@@ -427,53 +360,56 @@ class UpstreamStreamReceiver(Protocol, TimeoutMixin):
         self.setTimeout(UPSTREAM_TIMEOUT)
 
     def dataReceived(self, data: bytes):
-        if not self.meta or self.meta.closed: return
+        if not self.meta or self.meta.closed:
+            return
         self.meta.enqueue(data)
-        # trigger the send loop only when new data arrives
+        # New data -> wake send-loop
         self.h2_protocol.maybe_send_queued_data()
 
     def connectionLost(self, reason):
-        # Mark upstream closed and ensure client receives END_STREAM
         if self.meta and not self.meta.closed:
             self.meta.closed = True
-            # if there's no buffered data, send an explicit END_STREAM immediately
             try:
-                # Send an empty DATA frame with end_stream=True so the client sees the end.
+                # send explicit end_stream empty DATA
                 self.h2_protocol.h2_conn.send_data(self.meta.stream_id, b'', end_stream=True)
                 self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
             except Exception as e:
                 logger.debug("Failed to send END_STREAM for stream %d: %s", self.meta.stream_id, e)
-        # Trigger the send loop to let it finalize any remaining work
         self.h2_protocol.maybe_send_queued_data()
 
     def timeoutConnection(self):
         logger.warning("Upstream timeout for stream %d", self.meta.stream_id)
         self.meta.reset_stream(h2.errors.ErrorCodes.CANCEL)
-        self.transport.loseConnection()
-
+        try:
+            self.transport.loseConnection()
+        except Exception:
+            pass
 
 class UpstreamAgentRequest:
     MAX_RETRIES = 3
     RETRY_DELAY = 2
 
     def __init__(self, h2_protocol: "H2ProxyProtocol", stream_meta: StreamMeta,
-                 method: str, path: str, headers: List[Tuple[str,str]]):
+                 method: str, path: str, headers: List[Tuple[str, str]]):
         self.h2_protocol = h2_protocol
         self.meta = stream_meta
-        self.method = method.encode("ascii")
-        self.path = urllib.parse.quote(path, safe="/?=&")  # safe encoding
+        self.method = method if isinstance(method, bytes) else method.encode("ascii")
+        # allow safe chars in origin-form
+        self.path = urllib.parse.quote(path, safe="/?=&%:[]@!$&'()*+,;")
         self.headers = headers
 
     def start(self, attempt=1):
         url = f"http://{UPSTREAM_HOST}:{UPSTREAM_PORT}{self.path}".encode("ascii")
         hdrs = Headers()
         for k, v in self.headers:
-            if k.lower() in ("connection","proxy-connection","keep-alive","transfer-encoding"): continue
-            if k.lower() in ("server","x-powered-by"): continue
-            hdrs.addRawHeader(k, v)
+            kl = k.lower()
+            # remove hop-by-hop and forbidden headers
+            if kl in ("connection", "proxy-connection", "keep-alive", "transfer-encoding"):
+                continue
+            if kl in ("server", "x-powered-by"):
+                continue
+            hdrs.addRawHeader(kl, v)
         d = self.h2_protocol.agent.request(self.method, url, headers=hdrs)
-
-        # setup timeout
         timeout_call = reactor.callLater(UPSTREAM_TIMEOUT, lambda: d.cancel())
 
         def on_response(resp):
@@ -481,107 +417,101 @@ class UpstreamAgentRequest:
                 timeout_call.cancel()
             status = resp.code
             h2_headers = [(":status", str(status))]
-            raw_link_headers = []
+            raw_link_headers: List[str] = []
 
             for name, vals in resp.headers.getAllRawHeaders():
                 lname = name.decode().lower()
                 val = b", ".join(vals).decode()
-                if lname in ("connection","proxy-connection","keep-alive","transfer-encoding"):
+                if lname in ("connection", "proxy-connection", "keep-alive", "transfer-encoding"):
                     continue
                 h2_headers.append((lname, val))
                 if lname == "link":
                     raw_link_headers.append(val)
 
-            # Security & caching defaults (keep your ensures)
+            # Enforce some recommended headers if missing (security/caching)
             def ensure(hlist, key, val):
-                if not any(k.lower()==key.lower() for k,_ in hlist):
-                    hlist.append((key,val))
-            ensure(h2_headers,"cache-control","public, max-age=31536000")
-            ensure(h2_headers,"strict-transport-security","max-age=31536000; includeSubDomains")
-            ensure(h2_headers,"x-content-type-options","nosniff")
-            ensure(h2_headers,"x-frame-options","DENY")
-            ensure(h2_headers,"referrer-policy","no-referrer")
+                if not any(k.lower() == key.lower() for k, _ in hlist):
+                    hlist.append((key, val))
+            ensure(h2_headers, "cache-control", "public, max-age=31536000")
+            ensure(h2_headers, "x-content-type-options", "nosniff")
+            ensure(h2_headers, "x-frame-options", "DENY")
+            ensure(h2_headers, "referrer-policy", "no-referrer")
 
-            # Send headers to client
+            # Send headers (pseudo-headers already first in h2_headers)
             try:
-                self.h2_protocol.h2_conn.send_headers(self.meta.stream_id, h2_headers)
+                normalized_headers = []
+                for k, v in h2_headers:
+                    normalized_headers.append((k, v))
+                self.h2_protocol.h2_conn.send_headers(self.meta.stream_id, normalized_headers)
                 self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
             except Exception as e:
                 logger.debug("Failed to send H2 headers: %s", e)
 
-            # --- Parse and validate Link headers for push ---
-            # Only consider Link params that include rel=preload
-            # Only allow pushes for same-origin (relative paths) or same host as UPSTREAM_HOST.
-            def parse_link_entries(link_value: str):
-                # Basic parser: split on comma not inside quotes (simple approximation)
-                entries = []
-                cur = ""
-                inq = False
-                for ch in link_value:
-                    if ch == '"':
-                        inq = not inq
-                    if ch == ',' and not inq:
-                        entries.append(cur.strip())
-                        cur = ""
-                    else:
-                        cur += ch
-                if cur.strip():
-                    entries.append(cur.strip())
-
-                parsed = []
-                for ent in entries:
-                    # expect format: <url>; param1=..., param2="..."
-                    if '<' not in ent or '>' not in ent:
-                        continue
-                    url_part = ent[ent.find('<')+1:ent.find('>')].strip()
-                    params_part = ent[ent.find('>')+1:].strip()
-                    params = {}
-                    for p in params_part.split(';'):
-                        p = p.strip()
-                        if not p: continue
-                        if '=' in p:
-                            k, v = p.split('=',1)
-                            v = v.strip().strip('"')
-                            params[k.lower()] = v
+            # Only consider Link pushes for GET responses
+            if (self.meta.method and self.meta.method.upper() == "GET"):
+                def parse_link_entries(link_value: str):
+                    entries = []
+                    cur = ""
+                    inq = False
+                    for ch in link_value:
+                        if ch == '"':
+                            inq = not inq
+                        if ch == ',' and not inq:
+                            entries.append(cur.strip())
+                            cur = ""
                         else:
-                            params[p.lower()] = ""
-                    parsed.append((url_part, params))
-                return parsed
+                            cur += ch
+                    if cur.strip():
+                        entries.append(cur.strip())
 
-            for raw_link in raw_link_headers:
-                for url_part, params in parse_link_entries(raw_link):
-                    rel = params.get('rel','').lower()
-                    if 'preload' not in rel.split():
-                        # only respect rel=preload entries for push
-                        continue
+                    parsed = []
+                    for ent in entries:
+                        if '<' not in ent or '>' not in ent:
+                            continue
+                        url_part = ent[ent.find('<') + 1:ent.find('>')].strip()
+                        params_part = ent[ent.find('>') + 1:].strip()
+                        params = {}
+                        for p in params_part.split(';'):
+                            p = p.strip()
+                            if not p:
+                                continue
+                            if '=' in p:
+                                k, v = p.split('=', 1)
+                                v = v.strip().strip('"')
+                                params[k.lower()] = v
+                            else:
+                                params[p.lower()] = ""
+                        parsed.append((url_part, params))
+                    return parsed
 
-                    # Validate target: allow relative URLs or same host as UPSTREAM_HOST
-                    parsed = urllib.parse.urlparse(url_part)
-                    # Accept if no netloc (relative) or netloc matches UPSTREAM_HOST (optionally port)
-                    netloc_ok = False
-                    if parsed.netloc == "" or parsed.netloc is None:
-                        netloc_ok = True
-                    else:
-                        # strip possible port
-                        host_only = parsed.netloc.split(':',1)[0]
-                        if host_only == UPSTREAM_HOST:
+                for raw_link in raw_link_headers:
+                    for url_part, params in parse_link_entries(raw_link):
+                        rel = params.get('rel', '').lower()
+                        if 'preload' not in rel.split():
+                            continue
+
+                        parsed = urllib.parse.urlparse(url_part)
+                        netloc_ok = False
+                        if not parsed.netloc:
                             netloc_ok = True
+                        else:
+                            host_only = parsed.netloc.split(':', 1)[0]
+                            if host_only == UPSTREAM_HOST:
+                                netloc_ok = True
 
-                    if not netloc_ok:
-                        logger.debug("Skipping push for cross-origin Link target: %s", url_part)
-                        continue
+                        if not netloc_ok:
+                            logger.debug("Skipping push for cross-origin Link target: %s", url_part)
+                            continue
 
-                    # construct path (path + maybe query + maybe fragment omitted)
-                    push_path = parsed.path or '/'
-                    if parsed.query:
-                        push_path += '?' + parsed.query
+                        push_path = parsed.path or '/'
+                        if parsed.query:
+                            push_path += '?' + parsed.query
 
-                    try:
-                        self.h2_protocol.initiate_push(self.meta.stream_id, push_path)
-                    except Exception as e:
-                        logger.debug("initiate_push skipped/failed for %s: %s", push_path, e)
+                        try:
+                            self.h2_protocol.initiate_push(self.meta.stream_id, push_path)
+                        except Exception as e:
+                            logger.debug("initiate_push skipped/failed for %s: %s", push_path, e)
 
-            # deliver body to receiver
             resp.deliverBody(UpstreamStreamReceiver(self.h2_protocol, self.meta))
             return resp
 
@@ -590,105 +520,228 @@ class UpstreamAgentRequest:
                 timeout_call.cancel()
             if attempt < self.MAX_RETRIES:
                 logger.warning("Upstream fetch failed, retrying %d/%d: %s", attempt, self.MAX_RETRIES, f)
-                reactor.callLater(self.RETRY_DELAY, lambda: self.start(attempt+1))
+                reactor.callLater(self.RETRY_DELAY, lambda: self.start(attempt + 1))
             else:
                 logger.error("Upstream fetch failed for stream %d: %s", self.meta.stream_id, f)
-                if self.meta: self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
+                if self.meta:
+                    self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
 
         d.addCallbacks(on_response, on_error)
         return d
 
-# ---------- H2 Protocol ----------
+# ---------------------------------------------------------------------
+# H2 protocol implementation (server-side)
+# ---------------------------------------------------------------------
 class H2ProxyProtocol:
     def __init__(self, transport):
         self.transport = transport
-        self.h2_conn = h2.connection.H2Connection(h2.config.H2Configuration(client_side=False))
-        self.stream_meta: Dict[int,StreamMeta] = {}
+        cfg = h2.config.H2Configuration(client_side=False, header_encoding="utf-8")
+        self.h2_conn = h2.connection.H2Connection(config=cfg)
+        self.stream_meta: Dict[int, StreamMeta] = {}
         self.waiters: List[Deferred] = []
         self.sending = False
         self.max_concurrent_streams = MAX_CONCURRENT_STREAMS_DEFAULT
-        self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
-        # Removed tight LoopingCall(0.001) to avoid busy-polling.
-        # The send-loop is driven by events: incoming upstream data, window updates, or explicit wakeups.
+        self.max_frame_size = MAX_FRAME_SIZE_DEFAULT
+        # idle timer will be set in connection wrapper
+        self._idle_call = None
         self.agent = Agent(reactor, BrowserLikePolicyForHTTPS())
 
+        # Advertise sensible settings immediately
+        try:
+            self.h2_conn.initiate_connection()
+            settings = {
+                h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: INITIAL_WINDOW_SIZE_DEFAULT,
+                h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: MAX_CONCURRENT_STREAMS_DEFAULT,
+                h2.settings.SettingCodes.MAX_FRAME_SIZE: self.max_frame_size
+            }
+            self.h2_conn.update_settings(settings)
+            # Note: data_to_send will be written by wrapper that created this instance
+        except Exception:
+            pass
+
+    # Connection idle handler
     def on_connection_idle(self):
+        # If there are active streams, extend idle timer; otherwise close
         if any(not s.closed for s in self.stream_meta.values()):
             self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
             return
-        try: self.transport.loseConnection()
-        except Exception: pass
+        # Graceful close
+        try:
+            self.shutdown(error=h2.errors.ErrorCodes.NO_ERROR)
+        except Exception:
+            try:
+                self.transport.loseConnection()
+            except Exception:
+                pass
 
     def handle_request(self, event: h2.events.RequestReceived):
         safe_increment("requests_total", 1)
-
         try:
-            if self._idle_call.active():
-                self._idle_call.cancel()
+            if self._idle_call and getattr(self._idle_call, "active", lambda: False)():
+                try:
+                    self._idle_call.cancel()
+                except Exception:
+                    pass
         except Exception:
             pass
         self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
 
+        # normalize header names to lowercase strings
+        headers: List[Tuple[str, str]] = []
+        for k, v in event.headers:
+            key = k.decode() if isinstance(k, bytes) else k
+            val = v.decode() if isinstance(v, bytes) else v
+            headers.append((key.lower(), val))
 
-        headers = [(k.decode() if isinstance(k, bytes) else k,
-                    v.decode() if isinstance(v, bytes) else v) for k,v in event.headers]
-        method = next((v for k,v in headers if k==":method"), None)
-        path = next((v for k,v in headers if k==":path"), None)
-        if not method or not path:
+        # fetch pseudo-headers
+        method = next((v for k, v in headers if k == ":method"), None)
+        path = next((v for k, v in headers if k == ":path"), None)
+        scheme = next((v for k, v in headers if k == ":scheme"), None)
+        authority = next((v for k, v in headers if k == ":authority"), None)
+
+        # validate pseudo-headers per RFC 7540 §8.1.2.3
+        if not method or not path or not scheme or not authority:
             try:
-                self.h2_conn.reset_stream(event.stream_id, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR)
+                self.h2_conn.reset_stream(event.stream_id, error_code=int(h2.errors.ErrorCodes.PROTOCOL_ERROR))
                 self.transport.write(self.h2_conn.data_to_send())
-            except Exception: pass
+            except Exception:
+                pass
             return
 
-        if len(self.stream_meta) >= self.max_concurrent_streams:
+        # Only handle GET/HEAD (as per original logic)
+        if method.upper() not in ("GET", "HEAD"):
             try:
-                hdrs = [(":status","503"),("content-length","0")]
-                self.h2_conn.send_headers(event.stream_id,hdrs,end_stream=True)
+                hdrs = [(":status", "405"), ("content-length", "0")]
+                self.h2_conn.send_headers(event.stream_id, hdrs, end_stream=True)
                 self.transport.write(self.h2_conn.data_to_send())
                 incr_streams_reset()
-            except Exception: pass
+            except Exception:
+                pass
             return
 
-        meta = StreamMeta(event.stream_id, self)
+        # concurrency limit
+        if len(self.stream_meta) >= self.max_concurrent_streams:
+            try:
+                hdrs = [(":status", "503"), ("content-length", "0")]
+                self.h2_conn.send_headers(event.stream_id, hdrs, end_stream=True)
+                self.transport.write(self.h2_conn.data_to_send())
+                incr_streams_reset()
+            except Exception:
+                pass
+            return
+
+        meta = StreamMeta(event.stream_id, self, method=method)
         self.stream_meta[event.stream_id] = meta
         safe_increment("active_streams", 1)
-        upstream_headers = [(k.lower(),v) for k,v in headers if not k.startswith(":")]
+
+        # Build upstream headers excluding pseudo-headers
+        upstream_headers = [(k, v) for k, v in headers if not k.startswith(":")]
         UpstreamAgentRequest(self, meta, method, path, upstream_headers).start()
 
     def dataReceived(self, data: bytes):
+        # reset idle timer
         try:
-            if self._idle_call.active(): self._idle_call.cancel()
-        except Exception: pass
+            if self._idle_call and getattr(self._idle_call, "active", lambda: False)():
+                try:
+                    self._idle_call.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
-        events = self.h2_conn.receive_data(data)
+
+        # parse events from h2
+        try:
+            events = self.h2_conn.receive_data(data)
+        except Exception:
+            # protocol error: send GOAWAY and close
+            self.shutdown(error=h2.errors.ErrorCodes.PROTOCOL_ERROR)
+            return
+
         for event in events:
             if isinstance(event, h2.events.RequestReceived):
                 self.handle_request(event)
+
             elif isinstance(event, h2.events.DataReceived):
                 sid = event.stream_id
                 incr_bytes_in(len(event.data))
                 meta = self.stream_meta.get(sid)
-                if meta: meta.set_body_timeout()
+                if meta:
+                    # We do not support request body streaming (only GET/HEAD)
+                    if meta.method and meta.method.upper() not in ("GET", "HEAD"):
+                        meta.reset_stream(h2.errors.ErrorCodes.PROTOCOL_ERROR)
+                    else:
+                        meta.set_body_timeout()
+                    # RFC 7540 §6.9: acknowledge received data to maintain flow-control
+                    try:
+                        self.h2_conn.acknowledge_received_data(len(event.data), sid)
+                    except Exception:
+                        # some h2 versions use different method; ignore if not present
+                        pass
+
             elif isinstance(event, h2.events.StreamEnded):
                 sid = event.stream_id
                 meta = self.stream_meta.get(sid)
                 if meta:
                     meta.closed = True
-                # Reset idle timer since a new stream just finished
                 try:
-                    if self._idle_call.active():
-                        self._idle_call.cancel()
+                    if self._idle_call and getattr(self._idle_call, "active", lambda: False)():
+                        try:
+                            self._idle_call.cancel()
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
+
             elif isinstance(event, h2.events.WindowUpdated):
+                # remote increased our outbound window: wake send loop
                 self._wake_waiters()
-                # wake send loop if waiting
                 self.maybe_send_queued_data()
+
             elif isinstance(event, h2.events.RemoteSettingsChanged):
-                if h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS in event.changed_settings:
-                    self.max_concurrent_streams = event.changed_settings[h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS]
+                changed = event.changed_settings
+                if h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS in changed:
+                    try:
+                        self.max_concurrent_streams = int(changed[h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS].new_value)
+                    except Exception:
+                        pass
+                if h2.settings.SettingCodes.MAX_FRAME_SIZE in changed:
+                    try:
+                        self.max_frame_size = int(changed[h2.settings.SettingCodes.MAX_FRAME_SIZE].new_value)
+                    except Exception:
+                        pass
+
+            elif isinstance(event, h2.events.SettingsReceived):
+                # MUST ack peer settings (RFC 7540 §6.5.3)
+                try:
+                    # newer h2 versions use: self.h2_conn.acknowledge_settings()
+                    # some accept the event; try both defensively
+                    try:
+                        self.h2_conn.acknowledge_settings(event)
+                    except TypeError:
+                        # fallback: call without args
+                        self.h2_conn.acknowledge_settings()
+                    self.transport.write(self.h2_conn.data_to_send())
+                except Exception:
+                    pass
+
+            elif isinstance(event, h2.events.SettingsAcknowledged):
+                logger.debug("Client acknowledged our SETTINGS")
+
+            elif isinstance(event, h2.events.PingReceived):
+                # reply with PING ACK (RFC 7540 §6.7)
+                try:
+                    # h2 provides ping_acknowledge or ping_reply depending on version
+                    try:
+                        self.h2_conn.ping_acknowledge(event.ping_data)
+                    except AttributeError:
+                        # fallback
+                        self.h2_conn.ping(event.ping_data, ack=True)
+                    self.transport.write(self.h2_conn.data_to_send())
+                except Exception:
+                    pass
+
             elif isinstance(event, h2.events.PriorityUpdated):
                 sid = event.stream_id
                 meta = self.stream_meta.get(sid)
@@ -698,28 +751,39 @@ class H2ProxyProtocol:
                 meta.weight = event.weight
                 meta.depends_on = event.depends_on
                 meta.exclusive = event.exclusive
+
             elif isinstance(event, h2.events.StreamReset):
                 sid = event.stream_id
                 if sid in self.stream_meta:
-                    self.stream_meta[sid].clear()
-                # Reset idle timer after stream reset
+                    try:
+                        self.stream_meta[sid].clear()
+                    except Exception:
+                        pass
                 try:
-                    if self._idle_call.active():
-                        self._idle_call.cancel()
+                    if self._idle_call and getattr(self._idle_call, "active", lambda: False)():
+                        try:
+                            self._idle_call.cancel()
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
 
-        # Try to send any queued data if possible
+        # After processing events, try to send any queued frames
         self.maybe_send_queued_data()
-        self.transport.write(self.h2_conn.data_to_send())
+        try:
+            self.transport.write(self.h2_conn.data_to_send())
+        except Exception:
+            pass
 
     def _wake_waiters(self):
         waiters = list(self.waiters)
         self.waiters.clear()
         for d in waiters:
-            try: d.callback(None)
-            except Exception: pass
+            try:
+                d.callback(None)
+            except Exception:
+                pass
 
     def wait_for_window(self) -> Deferred:
         d = Deferred()
@@ -728,115 +792,145 @@ class H2ProxyProtocol:
 
     def maybe_send_queued_data(self):
         """
-        Event-driven trigger to run the send loop.
-        We set a 'sending' flag and schedule the _send_loop to run on next reactor tick.
+        Trigger sending of queued data if not already sending.
         """
-        if getattr(self, "sending", False):
+        if getattr(self, "_sending_loop_active", False):
             return
-        self.sending = True
         reactor.callLater(0, self._send_loop)
 
     def _send_loop(self):
-        # Clear sending flag at the end (in finally); if send-loop re-triggers maybe_send_queued_data
+        """
+        Iteratively send buffered data for all active streams, respecting
+        flow-control windows and frame size limits.
+        """
+        if getattr(self, "_sending_loop_active", False):
+            return
+        self._sending_loop_active = True
+
         try:
-            active_streams = {s.stream_id:s for s in self.stream_meta.values() if s.buffered_bytes>0 and not s.closed}
+            # Collect active streams with data
+            active_streams = [s for s in self.stream_meta.values()
+                              if s.buffered_bytes > 0 and not s.closed]
             if not active_streams:
                 return
 
-            tree: Dict[int, List[StreamMeta]] = {}
-            for meta in active_streams.values():
-                parent = meta.depends_on or 0
-                tree.setdefault(parent, [])
-                if meta.exclusive and parent in tree:
-                    existing = tree[parent]
-                    for sib in existing:
-                        sib.depends_on = meta.stream_id
-                    tree[meta.stream_id] = existing
-                    tree[parent] = [meta]
-                else:
-                    tree[parent].append(meta)
+            for meta in active_streams:
+                while meta.buffered_bytes > 0:
+                    conn_window = self.h2_conn.local_flow_control_window(meta.stream_id)
+                    if conn_window <= 0:
+                        # Wait asynchronously for WINDOW_UPDATE
+                        d = self.wait_for_window()
+                        d.addCallback(lambda _: self._send_loop())
+                        return
 
-            def send_branch(parent_id, ratio=1.0):
-                children = tree.get(parent_id, [])
-                total_weight = sum((c.weight or 16) for c in children) or 1
-                for child in children:
-                    child_ratio = ratio * ((child.weight or 16) / total_weight)
-                    while child.buffered_bytes > 0:
-                        conn_window = self.h2_conn.local_flow_control_window(child.stream_id)
-                        if conn_window <= 0:
-                            # Wait for window update; schedule wakeup on window update
-                            d = self.wait_for_window()
-                            d.addCallback(lambda _: self._send_loop())
-                            return False
-                        chunk_size = min(child.buffered_bytes, MAX_FRAME_SIZE, conn_window)
-                        chunk = child.pop_chunk(chunk_size)
-                        if not chunk: break
-                        try:
-                            self.h2_conn.send_data(child.stream_id, chunk)
-                            incr_bytes_out(len(chunk))
-                        except Exception as e:
-                            logger.debug("Send failed for stream %d: %s", child.stream_id, e)
-                            child.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
-                            break
-                        self.transport.write(self.h2_conn.data_to_send())
-                    # Recurse into this child's children (priority tree)
-                    send_branch(child.stream_id, child_ratio)
-                return True
+                    frame_limit = min(self.max_frame_size, MAX_FRAME_SIZE_DEFAULT)
+                    chunk_size = min(meta.buffered_bytes, frame_limit, conn_window)
+                    chunk = meta.pop_chunk(chunk_size)
+                    if not chunk:
+                        break
 
-            send_branch(0)
+                    try:
+                        self.h2_conn.send_data(meta.stream_id, chunk)
+                        incr_bytes_out(len(chunk))
+                    except Exception as e:
+                        logger.debug("Send failed for stream %d: %s", meta.stream_id, e)
+                        meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
+                        break
 
-        except Exception as e:
-            logger.error("Error in _send_loop: %s", e)
+            # Flush queued frames once at the end
+            try:
+                data_to_send = self.h2_conn.data_to_send()
+                if data_to_send:
+                    self.transport.write(data_to_send)
+            except Exception:
+                pass
+
         finally:
-            # mark sending complete (allows future wakeups)
-            self.sending = False
+            self._sending_loop_active = False
 
-    def initiate_push(self, parent_stream_id:int, link_path:str):
-        """
-        Hardened push: only accept relative paths or paths that reference the UPSTREAM_HOST.
-        `link_path` here should be a path (e.g. "/static/foo.js" or "/img/a.png?q=1").
-        """
-        # If the caller supplied a full URL, parse it; if it's already a path, parsed.path is that.
+
+    def initiate_push(self, parent_stream_id: int, link_path: str):
         parsed = urllib.parse.urlparse(link_path)
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
 
-        # Disallow absolute cross-origin pushes
-        if parsed.netloc and parsed.netloc.split(':',1)[0] != UPSTREAM_HOST:
+        if parsed.netloc and parsed.netloc.split(':', 1)[0] != UPSTREAM_HOST:
             logger.debug("Refusing to push cross-origin resource: %s", link_path)
             return
 
         try:
             sid = self.h2_conn.get_next_available_stream_id()
-            # Use scheme https and authority equal to the host client expects (use UPSTREAM_HOST)
-            headers=[(":method","GET"),(":path",path),(":scheme","https"),
-                     (":authority", parsed.netloc or UPSTREAM_HOST)]
-            # push_stream can raise if server doesn't allow; guard it
+            headers = [(":method", "GET"), (":path", path), (":scheme", "https"),
+                       (":authority", parsed.netloc or UPSTREAM_HOST)]
             self.h2_conn.push_stream(parent_stream_id, sid, headers)
             self.transport.write(self.h2_conn.data_to_send())
         except Exception as e:
             logger.debug("Push failed for %s: %s", path, e)
 
+    def shutdown(self, error=h2.errors.ErrorCodes.NO_ERROR):
+        """Send GOAWAY and close connection gracefully (RFC 7540 §6.8)."""
+        try:
+            last_sid = max(self.stream_meta.keys()) if self.stream_meta else 0
+            # Some h2 versions accept 'last_stream_id' arg name
+            try:
+                self.h2_conn.close_connection(error_code=int(error), last_stream_id=last_sid)
+            except TypeError:
+                # fallback if different signature
+                self.h2_conn.close_connection(error_code=int(error))
+            self.transport.write(self.h2_conn.data_to_send())
+        except Exception:
+            pass
+        try:
+            self.transport.loseConnection()
+        except Exception:
+            pass
 
-# ---------- TLS Listener ----------
+# ---------- TLS Listener (wrapper) ----------
 class H2ProtocolWrapper(Protocol):
     def connectionMade(self):
+        # instantiate the core protocol implementation and register
         self.h2 = H2ProxyProtocol(self.transport)
-        self.h2.h2_conn.initiate_connection()
-        self.transport.write(self.h2.h2_conn.data_to_send())
-    def dataReceived(self, data): self.h2.dataReceived(data)
+        # set idle timer for the created H2ProxyProtocol
+        try:
+            self.h2._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.h2.on_connection_idle)
+        except Exception:
+            pass
+        # add to global active set for graceful shutdown
+        _active_h2_protocols.add(self.h2)
+        try:
+            # write initial frames (H2Connection.initiate_connection called in H2ProxyProtocol.__init__)
+            self.transport.write(self.h2.h2_conn.data_to_send())
+        except Exception:
+            pass
+
+    def connectionLost(self, reason=None):
+        try:
+            _active_h2_protocols.discard(self.h2)
+        except Exception:
+            pass
+
+    def dataReceived(self, data):
+        self.h2.dataReceived(data)
 
 class H2Factory(Factory):
-    def buildProtocol(self, addr): return H2ProtocolWrapper()
+    def buildProtocol(self, addr):
+        return H2ProtocolWrapper()
 
 def start_tls_listener():
     ctx = pyssl.SSLContext(pyssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile=CERT_FILE,keyfile=KEY_FILE)
-    ctx.options |= pyssl.OP_NO_TLSv1 | pyssl.OP_NO_TLSv1_1
+    ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    # disable old TLS versions
+    try:
+        ctx.options |= pyssl.OP_NO_TLSv1 | pyssl.OP_NO_TLSv1_1
+    except Exception:
+        pass
     ctx.set_ciphers("ECDHE+AESGCM:!aNULL:!MD5:!3DES")
-    ctx.set_alpn_protocols(["h2"])
-    reactor.listenSSL(LISTEN_PORT,H2Factory(),ctx)
+    try:
+        ctx.set_alpn_protocols(["h2"])
+    except Exception:
+        pass
+    reactor.listenSSL(LISTEN_PORT, H2Factory(), ctx)
 
 # ---------- Metrics server ----------
 def start_metrics_server():
@@ -846,22 +940,29 @@ def start_metrics_server():
         reactor.listenTCP(METRICS_PORT, Site(root))
 
 # ---------- Signal Handling ----------
-def shutdown(*args):
+def shutdown_all(*args):
+    logger.info("Shutdown requested - sending GOAWAY to all active connections")
+    # iterate snapshot
+    for proto in list(_active_h2_protocols):
+        try:
+            proto.shutdown(error=h2.errors.ErrorCodes.NO_ERROR)
+        except Exception:
+            pass
+    # cleanup ipset rules
     cleanup_ipset_and_rule()
-    reactor.stop()
+    # stop reactor after a short grace to allow frames to flush
+    reactor.callLater(0.5, reactor.stop)
 
-signal.signal(signal.SIGINT, shutdown)
-signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown_all)
+signal.signal(signal.SIGTERM, shutdown_all)
 
 # ---------- Periodic Cloudflare IP refresh ----------
 def start_periodic_ip_refresh():
-    # Immediate refresh first
     refresh_ipset_async()
-    # Schedule hourly refresh
     loop = task.LoopingCall(refresh_ipset_async)
     loop.start(IP_REFRESH_INTERVAL, now=False)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     setup_ipset_and_rule()
     start_periodic_ip_refresh()
     start_tls_listener()
