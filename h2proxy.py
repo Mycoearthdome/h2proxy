@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-# Hardened HTTP/2 -> HTTP/1.1 streaming proxy with safe _send_loop, retries, metrics, ALPN, push, and Cloudflare IP whitelist
-
-# Please install the following.....
-# sudo apt install python3-systemd ipset
-# pip install prometheus-client
+# Hardened HTTP/2 -> HTTP/1.1 streaming proxy (modified: clamped metrics + event-driven send loop)
 
 from __future__ import annotations
 import sys, time, logging, signal, ipaddress, subprocess, urllib.parse
 from typing import Dict, List, Optional, Tuple
 
-from twisted.internet import reactor, task
+from twisted.internet import reactor, task, defer
 from twisted.internet.threads import deferToThread
 from twisted.internet.protocol import Protocol, Factory
 from twisted.web.client import Agent, BrowserLikePolicyForHTTPS
@@ -17,12 +13,18 @@ from twisted.web.resource import Resource
 from twisted.web.server import Site
 from twisted.web.http_headers import Headers
 from twisted.internet.defer import Deferred
+from twisted.protocols.policies import TimeoutMixin
 
 import h2.connection, h2.events, h2.config, h2.settings
 import ssl as pyssl
 
+import os
+import urllib.request
+
 # ---------- Configuration ----------
 CLOUDFLARE_IPS_URL = "https://www.cloudflare.com/ips-v4"
+# ---------- IPSet helpers (dual-stack, kernel-backed, threaded fetch) ----------
+# single canonical ipset name used by OS-level firewall
 IPSET_NAME = "cloudflare_whitelist"
 LISTEN_PORT = 443
 UPSTREAM_HOST = "127.0.0.1"
@@ -40,6 +42,7 @@ CONNECTION_IDLE_TIMEOUT = 300
 STREAM_INACTIVITY_TIMEOUT = 120
 STREAM_BODY_TIMEOUT = 60
 METRICS_PORT = 9100
+UPSTREAM_TIMEOUT = 30  # seconds
 
 LOG_LEVEL = logging.INFO
 logger = logging.getLogger("h2proxy")
@@ -72,22 +75,56 @@ except Exception:
     USE_PROMETHEUS_CLIENT = False
 
 def safe_increment(metric_name, n=1):
-    reactor.callFromThread(lambda: metrics.update({metric_name: metrics.get(metric_name,0)+n}))
-    if USE_PROMETHEUS_CLIENT:
-        try:
-            if metric_name=="requests_total": PROM_REQUESTS.inc(n)
-            elif metric_name=="active_streams": PROM_ACTIVE.inc(n)
-            elif metric_name=="bytes_in_total": PROM_BYTES_IN.inc(n)
-            elif metric_name=="bytes_out_total": PROM_BYTES_OUT.inc(n)
-            elif metric_name=="streams_reset_total": PROM_RST.inc(n)
-        except Exception: pass
+    """
+    Thread-safe metric update executed on the reactor thread.
+    - active_streams is clamped to >= 0 and sets the Prometheus gauge to the exact value.
+    - Counters are only incremented (ignore negative attempts).
+    """
+    def _inc():
+        old = metrics.get(metric_name, 0)
+        new = old + n
+
+        if metric_name == "active_streams":
+            # clamp
+            if new < 0:
+                new = 0
+            metrics[metric_name] = new
+            if USE_PROMETHEUS_CLIENT:
+                try:
+                    PROM_ACTIVE.set(new)
+                except Exception:
+                    pass
+            return
+
+        # for counters, avoid decrementing them via this function (only support positive increments)
+        if metric_name in ("requests_total","bytes_in_total","bytes_out_total","streams_reset_total","ipset_refresh_count"):
+            if n > 0:
+                metrics[metric_name] = new
+                if USE_PROMETHEUS_CLIENT:
+                    try:
+                        if metric_name == "requests_total": PROM_REQUESTS.inc(n)
+                        elif metric_name == "bytes_in_total": PROM_BYTES_IN.inc(n)
+                        elif metric_name == "bytes_out_total": PROM_BYTES_OUT.inc(n)
+                        elif metric_name == "streams_reset_total": PROM_RST.inc(n)
+                        # ipset_refresh_count is an internal counter; we don't map it to a Prom client metric here
+                    except Exception:
+                        pass
+            else:
+                # ignore negative adjustments to counters to prevent inconsistencies
+                metrics[metric_name] = max(0, old + n)
+        else:
+            # generic fallback
+            metrics[metric_name] = max(0, new)
+
+    try:
+        reactor.callFromThread(_inc)
+    except Exception:
+        # If reactor not running (unit tests/etc), run inline
+        _inc()
 
 def incr_bytes_out(n:int): safe_increment("bytes_out_total", n)
 def incr_bytes_in(n:int): safe_increment("bytes_in_total", n)
 def incr_streams_reset(): safe_increment("streams_reset_total", 1)
-
-# ---------- IPSet helpers ----------
-_cloudflare_networks: List[ipaddress.IPv4Network] = []
 
 def run_cmd_blocking(cmd: List[str]) -> bool:
     try:
@@ -96,47 +133,147 @@ def run_cmd_blocking(cmd: List[str]) -> bool:
     except subprocess.CalledProcessError:
         return False
 
-class IPCollector(Protocol):
-    def __init__(self, deferred: Deferred):
-        self.deferred = deferred
-        self.body = b""
+class IPCollector:
+    CF_IPS_V4 = "https://www.cloudflare.com/ips-v4"
+    CF_IPS_V6 = "https://www.cloudflare.com/ips-v6"
 
-    def dataReceived(self, data: bytes):
-        self.body += data
+    def __init__(self):
+        # cached set of CIDR strings
+        self.valid_ips = set()
+
+    def _fetch_ips_blocking(self) -> List[str]:
+        """Blocking fetch of both IPv4 and IPv6 Cloudflare lists."""
+        urls = [self.CF_IPS_V4, self.CF_IPS_V6]
+        all_ips: List[str] = []
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    text = resp.read().decode("utf-8")
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                all_ips.extend(lines)
+            except Exception as e:
+                logger.warning("Failed to fetch %s: %s", url, e)
+        return all_ips
+
+    def refresh_ipset_blocking(self) -> bool:
+        """
+        Blocking: fetch Cloudflare ranges and atomically update the kernel ipset.
+        Returns True on success.
+        """
+        ips = self._fetch_ips_blocking()
+        if not ips:
+            logger.warning("No Cloudflare IP ranges fetched; skipping ipset update")
+            return False
+
+        # Build a temporary set, add members, then swap
+        tmp_set = IPSET_NAME + "_tmp"
+        try:
+            subprocess.run(["ipset","create",tmp_set,"hash:net"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        for cidr in ips:
+            try:
+                subprocess.run(["ipset","add",tmp_set,cidr,"-exist"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+        # swap into place
+        try:
+            subprocess.run(["ipset","swap",tmp_set,IPSET_NAME], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["ipset","destroy",tmp_set], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logger.warning("ipset swap/destroy failed: %s", e)
+            return False
+
+        # update memory cache of ip networks for fallback checks
+        try:
+            self.valid_ips = set(ips)
+        except Exception:
+            self.valid_ips = set(ips)
+
+        safe_increment("ipset_refresh_count", 1)
+        logger.info("Refreshed ipset %s with %d entries", IPSET_NAME, len(self.valid_ips))
+        return True
+
+    def refresh_ipset(self):
+        """Schedule the blocking refresh on reactor threadpool."""
+        return deferToThread(self.refresh_ipset_blocking)
+
+    def is_valid_ip(self, ip: str) -> bool:
+        """
+        Prefer kernel ipset test (fast). If ipset isn't available or test fails, fall back
+        to in-memory CIDR matching.
+        """
+        # Try kernel-level ipset test first
+        try:
+            res = subprocess.run(["ipset","test",IPSET_NAME,ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            # ipset not available/permission denied -> fall back
+            pass
+
+        # Fallback: check against cached CIDRs
+        try:
+            ipaddr = ipaddress.ip_address(ip)
+            for net in self.valid_ips:
+                try:
+                    if ipaddr in ipaddress.ip_network(net):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+# ---------- IPSet helpers ----------
+# instantiate a collector for the program to share
+ip_collector = IPCollector()
+
+
+class IPWhitelistProxy(Protocol):
+    def __init__(self, factory):
+        self.factory = factory
+        self.transport = None
+        self.client_ip = None
+
+    def connectionMade(self):
+        peer = self.transport.getPeer()
+        self.client_ip = peer.host
+        if not ip_collector.is_valid_ip(self.client_ip):
+            logger.warning(f"Connection rejected: {self.client_ip} not in Cloudflare ranges")
+            self.transport.loseConnection()
+            return
+        logger.info(f"Accepted proxied client from {self.client_ip}")
+        # Continue with normal H2 setup
+        self.factory.active_connections.add(self)
+        self.factory.protocol_instance = self
+        self.factory.h2_conn.initiate_connection()
+        self.factory._send_data()
 
     def connectionLost(self, reason):
-        body = self.body.decode(errors="ignore")
-        nets = [line.strip() for line in body.splitlines() if line.strip()]
+        if self in self.factory.active_connections:
+            self.factory.active_connections.remove(self)
 
-        def _do_update():
-            new_set = IPSET_NAME + "_new"
-            run_cmd_blocking(["ipset","create",new_set,"hash:net","-exist"])
-            for net in nets: run_cmd_blocking(["ipset","add",new_set,net,"-exist"])
-            run_cmd_blocking(["ipset","swap",new_set,IPSET_NAME])
-            run_cmd_blocking(["ipset","destroy",new_set])
-            global _cloudflare_networks
-            _cloudflare_networks = [ipaddress.ip_network(n) for n in nets]
-            safe_increment('ipset_refresh_count')
-            return True
-
-        d = deferToThread(_do_update)
-        d.addBoth(lambda r: self.deferred.callback(True))
 
 def refresh_ipset_async(retries=3, delay=2):
-    agent = Agent(reactor, BrowserLikePolicyForHTTPS())
-    def _do_refresh(attempt=1):
-        d = agent.request(b"GET", CLOUDFLARE_IPS_URL.encode("ascii"))
-        def on_response(resp):
-            done = Deferred()
-            resp.deliverBody(IPCollector(done))
-            return done
-        d.addCallback(on_response)
-        def on_error(failure):
+    """
+    Use the IPCollector.refresh_ipset to update ipset (runs in threadpool).
+    If it fails, schedule retries with exponential backoff.
+    """
+    def _attempt(attempt=1):
+        d = ip_collector.refresh_ipset()
+        def _on_done(res):
+            # success or failure handled by collector; nothing else to do
+            return res
+        def _on_err(err):
+            logger.warning("refresh_ipset attempt %d failed: %s", attempt, err)
             if attempt < retries:
-                reactor.callLater(delay*(2**(attempt-1)), _do_refresh, attempt+1)
-            else: logger.error("Failed Cloudflare IP fetch: %s", failure)
-        d.addErrback(on_error)
-    _do_refresh()
+                reactor.callLater(delay * (2 ** (attempt - 1)), _attempt, attempt + 1)
+            else:
+                logger.error("Failed to refresh ipset after %d attempts", attempt)
+        d.addCallbacks(_on_done, _on_err)
+    _attempt()
 
 def setup_ipset_and_rule():
     def _bootstrap():
@@ -163,15 +300,25 @@ def cleanup_ipset_and_rule():
         except Exception: pass
     deferToThread(_cleanup)
 
-def ipset_contains_peer(ip:str)->bool:
+def ipset_contains_peer(ip: str) -> bool:
     try:
         ipaddr = ipaddress.ip_address(ip)
-        return any(ipaddr in net for net in _cloudflare_networks)
-    except Exception: pass
+        # Use the cached Cloudflare networks from the collector
+        return any(ipaddr in ipaddress.ip_network(net) for net in ip_collector.valid_ips)
+    except Exception:
+        pass
+
+    # Fallback: kernel ipset check
     try:
-        res = subprocess.run(["ipset","test",IPSET_NAME,ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        res = subprocess.run(
+            ["ipset", "test", IPSET_NAME, ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False
+        )
         return res.returncode == 0
-    except Exception: return False
+    except Exception:
+        return False
 
 # ---------- Stream Metadata ----------
 class StreamMeta:
@@ -204,6 +351,7 @@ class StreamMeta:
         self.end += len(data)
         self.last_activity = time.time()
         if self.buffered_bytes > MAX_BUFFER_PER_STREAM:
+            # reset with ENHANCE_YOUR_CALM when buffer grows too large
             self.reset_stream(h2.errors.ErrorCodes.ENHANCE_YOUR_CALM)
             return
         if len(data) > 1024: self.reset_inactivity_timer()
@@ -257,6 +405,7 @@ class StreamMeta:
         self.clear()
 
     def clear(self):
+        # decrement active_streams (clamped in safe_increment)
         safe_increment("active_streams",-1)
         self.buffer = bytearray()
         self.start = 0
@@ -264,27 +413,44 @@ class StreamMeta:
         self.cancel_timers()
         try: del self.protocol_ref.stream_meta[self.stream_id]
         except KeyError: pass
+        # Observe duration if Prometheus enabled
         if USE_PROMETHEUS_CLIENT:
             duration = time.time() - self.start_time
             try: PROM_STREAM_LATENCY.observe(duration)
             except Exception: pass
-            try: PROM_ACTIVE.dec()
-            except Exception: pass
 
 # ---------- Upstream via Twisted Agent ----------
-class UpstreamStreamReceiver(Protocol):
+class UpstreamStreamReceiver(Protocol, TimeoutMixin):
     def __init__(self, h2_protocol: "H2ProxyProtocol", stream_meta: StreamMeta):
         self.h2_protocol = h2_protocol
         self.meta = stream_meta
+        self.setTimeout(UPSTREAM_TIMEOUT)
 
     def dataReceived(self, data: bytes):
         if not self.meta or self.meta.closed: return
         self.meta.enqueue(data)
+        # trigger the send loop only when new data arrives
         self.h2_protocol.maybe_send_queued_data()
 
     def connectionLost(self, reason):
-        if self.meta: self.meta.closed = True
+        # Mark upstream closed and ensure client receives END_STREAM
+        if self.meta and not self.meta.closed:
+            self.meta.closed = True
+            # if there's no buffered data, send an explicit END_STREAM immediately
+            try:
+                # Send an empty DATA frame with end_stream=True so the client sees the end.
+                self.h2_protocol.h2_conn.send_data(self.meta.stream_id, b'', end_stream=True)
+                self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
+            except Exception as e:
+                logger.debug("Failed to send END_STREAM for stream %d: %s", self.meta.stream_id, e)
+        # Trigger the send loop to let it finalize any remaining work
         self.h2_protocol.maybe_send_queued_data()
+
+    def timeoutConnection(self):
+        logger.warning("Upstream timeout for stream %d", self.meta.stream_id)
+        self.meta.reset_stream(h2.errors.ErrorCodes.CANCEL)
+        self.transport.loseConnection()
+
 
 class UpstreamAgentRequest:
     MAX_RETRIES = 3
@@ -307,18 +473,26 @@ class UpstreamAgentRequest:
             hdrs.addRawHeader(k, v)
         d = self.h2_protocol.agent.request(self.method, url, headers=hdrs)
 
+        # setup timeout
+        timeout_call = reactor.callLater(UPSTREAM_TIMEOUT, lambda: d.cancel())
+
         def on_response(resp):
+            if timeout_call.active():
+                timeout_call.cancel()
             status = resp.code
             h2_headers = [(":status", str(status))]
-            link_headers = []
+            raw_link_headers = []
+
             for name, vals in resp.headers.getAllRawHeaders():
                 lname = name.decode().lower()
                 val = b", ".join(vals).decode()
-                if lname in ("connection","proxy-connection","keep-alive","transfer-encoding"): continue
+                if lname in ("connection","proxy-connection","keep-alive","transfer-encoding"):
+                    continue
                 h2_headers.append((lname, val))
-                if lname == "link": link_headers.append(val)
+                if lname == "link":
+                    raw_link_headers.append(val)
 
-            # Security & caching
+            # Security & caching defaults (keep your ensures)
             def ensure(hlist, key, val):
                 if not any(k.lower()==key.lower() for k,_ in hlist):
                     hlist.append((key,val))
@@ -328,20 +502,92 @@ class UpstreamAgentRequest:
             ensure(h2_headers,"x-frame-options","DENY")
             ensure(h2_headers,"referrer-policy","no-referrer")
 
+            # Send headers to client
             try:
                 self.h2_protocol.h2_conn.send_headers(self.meta.stream_id, h2_headers)
                 self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
             except Exception as e:
                 logger.debug("Failed to send H2 headers: %s", e)
 
-            for link in link_headers:
-                try: self.h2_protocol.initiate_push(self.meta.stream_id, link)
-                except Exception: pass
+            # --- Parse and validate Link headers for push ---
+            # Only consider Link params that include rel=preload
+            # Only allow pushes for same-origin (relative paths) or same host as UPSTREAM_HOST.
+            def parse_link_entries(link_value: str):
+                # Basic parser: split on comma not inside quotes (simple approximation)
+                entries = []
+                cur = ""
+                inq = False
+                for ch in link_value:
+                    if ch == '"':
+                        inq = not inq
+                    if ch == ',' and not inq:
+                        entries.append(cur.strip())
+                        cur = ""
+                    else:
+                        cur += ch
+                if cur.strip():
+                    entries.append(cur.strip())
 
+                parsed = []
+                for ent in entries:
+                    # expect format: <url>; param1=..., param2="..."
+                    if '<' not in ent or '>' not in ent:
+                        continue
+                    url_part = ent[ent.find('<')+1:ent.find('>')].strip()
+                    params_part = ent[ent.find('>')+1:].strip()
+                    params = {}
+                    for p in params_part.split(';'):
+                        p = p.strip()
+                        if not p: continue
+                        if '=' in p:
+                            k, v = p.split('=',1)
+                            v = v.strip().strip('"')
+                            params[k.lower()] = v
+                        else:
+                            params[p.lower()] = ""
+                    parsed.append((url_part, params))
+                return parsed
+
+            for raw_link in raw_link_headers:
+                for url_part, params in parse_link_entries(raw_link):
+                    rel = params.get('rel','').lower()
+                    if 'preload' not in rel.split():
+                        # only respect rel=preload entries for push
+                        continue
+
+                    # Validate target: allow relative URLs or same host as UPSTREAM_HOST
+                    parsed = urllib.parse.urlparse(url_part)
+                    # Accept if no netloc (relative) or netloc matches UPSTREAM_HOST (optionally port)
+                    netloc_ok = False
+                    if parsed.netloc == "" or parsed.netloc is None:
+                        netloc_ok = True
+                    else:
+                        # strip possible port
+                        host_only = parsed.netloc.split(':',1)[0]
+                        if host_only == UPSTREAM_HOST:
+                            netloc_ok = True
+
+                    if not netloc_ok:
+                        logger.debug("Skipping push for cross-origin Link target: %s", url_part)
+                        continue
+
+                    # construct path (path + maybe query + maybe fragment omitted)
+                    push_path = parsed.path or '/'
+                    if parsed.query:
+                        push_path += '?' + parsed.query
+
+                    try:
+                        self.h2_protocol.initiate_push(self.meta.stream_id, push_path)
+                    except Exception as e:
+                        logger.debug("initiate_push skipped/failed for %s: %s", push_path, e)
+
+            # deliver body to receiver
             resp.deliverBody(UpstreamStreamReceiver(self.h2_protocol, self.meta))
             return resp
 
         def on_error(f):
+            if timeout_call.active():
+                timeout_call.cancel()
             if attempt < self.MAX_RETRIES:
                 logger.warning("Upstream fetch failed, retrying %d/%d: %s", attempt, self.MAX_RETRIES, f)
                 reactor.callLater(self.RETRY_DELAY, lambda: self.start(attempt+1))
@@ -362,8 +608,8 @@ class H2ProxyProtocol:
         self.sending = False
         self.max_concurrent_streams = MAX_CONCURRENT_STREAMS_DEFAULT
         self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
-        self._send_loop_task = task.LoopingCall(self._send_loop)
-        self._send_loop_task.start(0.001, now=False)
+        # Removed tight LoopingCall(0.001) to avoid busy-polling.
+        # The send-loop is driven by events: incoming upstream data, window updates, or explicit wakeups.
         self.agent = Agent(reactor, BrowserLikePolicyForHTTPS())
 
     def on_connection_idle(self):
@@ -374,7 +620,16 @@ class H2ProxyProtocol:
         except Exception: pass
 
     def handle_request(self, event: h2.events.RequestReceived):
-        safe_increment("requests_total")
+        safe_increment("requests_total", 1)
+
+        try:
+            if self._idle_call.active():
+                self._idle_call.cancel()
+        except Exception:
+            pass
+        self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
+
+
         headers = [(k.decode() if isinstance(k, bytes) else k,
                     v.decode() if isinstance(v, bytes) else v) for k,v in event.headers]
         method = next((v for k,v in headers if k==":method"), None)
@@ -397,11 +652,12 @@ class H2ProxyProtocol:
 
         meta = StreamMeta(event.stream_id, self)
         self.stream_meta[event.stream_id] = meta
+        safe_increment("active_streams", 1)
         upstream_headers = [(k.lower(),v) for k,v in headers if not k.startswith(":")]
         UpstreamAgentRequest(self, meta, method, path, upstream_headers).start()
 
     def dataReceived(self, data: bytes):
-        try: 
+        try:
             if self._idle_call.active(): self._idle_call.cancel()
         except Exception: pass
         self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
@@ -409,7 +665,6 @@ class H2ProxyProtocol:
         for event in events:
             if isinstance(event, h2.events.RequestReceived):
                 self.handle_request(event)
-                safe_increment("active_streams")
             elif isinstance(event, h2.events.DataReceived):
                 sid = event.stream_id
                 incr_bytes_in(len(event.data))
@@ -418,9 +673,19 @@ class H2ProxyProtocol:
             elif isinstance(event, h2.events.StreamEnded):
                 sid = event.stream_id
                 meta = self.stream_meta.get(sid)
-                if meta: meta.closed=True
+                if meta:
+                    meta.closed = True
+                # Reset idle timer since a new stream just finished
+                try:
+                    if self._idle_call.active():
+                        self._idle_call.cancel()
+                except Exception:
+                    pass
+                self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
             elif isinstance(event, h2.events.WindowUpdated):
                 self._wake_waiters()
+                # wake send loop if waiting
+                self.maybe_send_queued_data()
             elif isinstance(event, h2.events.RemoteSettingsChanged):
                 if h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS in event.changed_settings:
                     self.max_concurrent_streams = event.changed_settings[h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS]
@@ -435,7 +700,17 @@ class H2ProxyProtocol:
                 meta.exclusive = event.exclusive
             elif isinstance(event, h2.events.StreamReset):
                 sid = event.stream_id
-                if sid in self.stream_meta: self.stream_meta[sid].clear()
+                if sid in self.stream_meta:
+                    self.stream_meta[sid].clear()
+                # Reset idle timer after stream reset
+                try:
+                    if self._idle_call.active():
+                        self._idle_call.cancel()
+                except Exception:
+                    pass
+                self._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.on_connection_idle)
+
+        # Try to send any queued data if possible
         self.maybe_send_queued_data()
         self.transport.write(self.h2_conn.data_to_send())
 
@@ -452,16 +727,21 @@ class H2ProxyProtocol:
         return d
 
     def maybe_send_queued_data(self):
+        """
+        Event-driven trigger to run the send loop.
+        We set a 'sending' flag and schedule the _send_loop to run on next reactor tick.
+        """
         if getattr(self, "sending", False):
             return
         self.sending = True
         reactor.callLater(0, self._send_loop)
 
     def _send_loop(self):
-        if getattr(self,"sending",False) is False: self.sending = True
+        # Clear sending flag at the end (in finally); if send-loop re-triggers maybe_send_queued_data
         try:
             active_streams = {s.stream_id:s for s in self.stream_meta.values() if s.buffered_bytes>0 and not s.closed}
-            if not active_streams: return
+            if not active_streams:
+                return
 
             tree: Dict[int, List[StreamMeta]] = {}
             for meta in active_streams.values():
@@ -478,12 +758,13 @@ class H2ProxyProtocol:
 
             def send_branch(parent_id, ratio=1.0):
                 children = tree.get(parent_id, [])
-                total_weight = sum((c.weight or 16) for c in children)
+                total_weight = sum((c.weight or 16) for c in children) or 1
                 for child in children:
                     child_ratio = ratio * ((child.weight or 16) / total_weight)
                     while child.buffered_bytes > 0:
                         conn_window = self.h2_conn.local_flow_control_window(child.stream_id)
                         if conn_window <= 0:
+                            # Wait for window update; schedule wakeup on window update
                             d = self.wait_for_window()
                             d.addCallback(lambda _: self._send_loop())
                             return False
@@ -498,6 +779,7 @@ class H2ProxyProtocol:
                             child.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
                             break
                         self.transport.write(self.h2_conn.data_to_send())
+                    # Recurse into this child's children (priority tree)
                     send_branch(child.stream_id, child_ratio)
                 return True
 
@@ -506,19 +788,36 @@ class H2ProxyProtocol:
         except Exception as e:
             logger.error("Error in _send_loop: %s", e)
         finally:
+            # mark sending complete (allows future wakeups)
             self.sending = False
 
-    def initiate_push(self, parent_stream_id:int, link_header:str):
-        parsed = urllib.parse.urlparse(link_header.strip("<>"))
+    def initiate_push(self, parent_stream_id:int, link_path:str):
+        """
+        Hardened push: only accept relative paths or paths that reference the UPSTREAM_HOST.
+        `link_path` here should be a path (e.g. "/static/foo.js" or "/img/a.png?q=1").
+        """
+        # If the caller supplied a full URL, parse it; if it's already a path, parsed.path is that.
+        parsed = urllib.parse.urlparse(link_path)
         path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        # Disallow absolute cross-origin pushes
+        if parsed.netloc and parsed.netloc.split(':',1)[0] != UPSTREAM_HOST:
+            logger.debug("Refusing to push cross-origin resource: %s", link_path)
+            return
+
         try:
             sid = self.h2_conn.get_next_available_stream_id()
+            # Use scheme https and authority equal to the host client expects (use UPSTREAM_HOST)
             headers=[(":method","GET"),(":path",path),(":scheme","https"),
-                     (":authority",parsed.netloc or UPSTREAM_HOST)]
-            self.h2_conn.push_stream(parent_stream_id,sid,headers)
+                     (":authority", parsed.netloc or UPSTREAM_HOST)]
+            # push_stream can raise if server doesn't allow; guard it
+            self.h2_conn.push_stream(parent_stream_id, sid, headers)
             self.transport.write(self.h2_conn.data_to_send())
         except Exception as e:
-            logger.debug("Push failed: %s", e)
+            logger.debug("Push failed for %s: %s", path, e)
+
 
 # ---------- TLS Listener ----------
 class H2ProtocolWrapper(Protocol):
